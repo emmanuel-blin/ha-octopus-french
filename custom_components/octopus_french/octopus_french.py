@@ -5,12 +5,11 @@ import logging
 import re
 from collections.abc import Callable
 from contextlib import suppress
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from typing import Any, ClassVar
 
 import aiohttp
 import jwt
-from homeassistant.util import dt as dt_util
 
 from .utils import is_electricity_meter_active
 
@@ -273,12 +272,16 @@ QUERY_GET_BILLS = """
     }
 """
 
+# `first` : un contrat OctoTempo expose six registres, donc six entrées par jour.
+# 60 couvre dix jours, de quoi retrouver une journée consommée même quand les
+# derniers relevés sont vides. L'API refuse au-delà de 100
+# (« Invalid pagination parameters »).
 QUERY_GET_INDEX_ELECTRICITY = """
 query getElectricityIndex($accountNumber: String!, $prmId: String!) {
   electricityReading(
     accountNumber: $accountNumber
     prmId: $prmId
-    first: 8
+    first: 60
     calendarType: PROVIDER
   ) {
     edges {
@@ -895,6 +898,70 @@ class OctopusFrenchApiClient:
     }
 
     @staticmethod
+    def _reading_code(node: dict[str, Any]) -> str | None:
+        """Return the temporal class of a reading, structured field first."""
+        temporal_class = node.get("temporalClass") or {}
+        return temporal_class.get("code") or node.get("calendarTempClass")
+
+    @staticmethod
+    def _reading_date(node: dict[str, Any]) -> str:
+        """Return the local day a reading covers, as an ISO date."""
+        return (node.get("periodStartAt") or "")[:10]
+
+    @staticmethod
+    def _reading_consumption(node: dict[str, Any]) -> float:
+        """Return a reading consumption as a float, 0.0 when unusable."""
+        try:
+            return float(node.get("consumption") or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    @classmethod
+    def _color_totals_by_date(
+        cls, nodes: list[dict[str, Any]]
+    ) -> dict[str, dict[str, float]]:
+        """Sum the consumption of each Tempo color, day by day."""
+        totals: dict[str, dict[str, float]] = {}
+        for node in nodes:
+            code = (cls._reading_code(node) or "").upper()
+            color = cls._REGISTER_CODE_TO_COLOR.get(
+                code
+            ) or cls._CALENDAR_COLOR_TO_COLOR.get(code)
+            if not color:
+                continue
+            day = totals.setdefault(cls._reading_date(node), {})
+            day[color] = day.get(color, 0.0) + cls._reading_consumption(node)
+        return totals
+
+    @classmethod
+    def _resolve_tempo_color(
+        cls, nodes: list[dict[str, Any]]
+    ) -> tuple[str | None, str | None]:
+        """
+        Return the Tempo color of the most recent consumed day, and its date.
+
+        Un contrat OctoTempo expose six registres (HPE/HCE, HPHI/HCHI, HPP/HCP)
+        et l'API renvoie une entrée par registre pour une même journée. La
+        couleur du jour est celle des registres qui portent la consommation :
+        retenir la première entrée reçue donne une couleur arbitraire, figée par
+        l'ordre de l'API (issue #84).
+        """
+        totals = cls._color_totals_by_date(nodes)
+
+        for day in sorted(totals, reverse=True):
+            color, consumed = max(totals[day].items(), key=lambda item: item[1])
+            if consumed > 0:
+                return color, day or None
+
+        # Aucune consommation exploitable : la couleur reste sûre tant qu'un
+        # seul registre couvre la journée (contrats à `calendarTempClass`).
+        for day in sorted(totals, reverse=True):
+            if len(totals[day]) == 1:
+                return next(iter(totals[day])), day or None
+
+        return None, None
+
+    @staticmethod
     def _parse_rate_nodes(energy_rate: dict[str, Any]) -> list[dict[str, Any]]:
         """
         Normalise les taux de consommation d'un energySupplyRate.
@@ -1209,16 +1276,23 @@ class OctopusFrenchApiClient:
             _LOGGER.warning("No electricity readings in response for PRM %s", prm_id)
             return None
 
+        nodes = [node for edge in edges if (node := edge.get("node"))]
+        tempo_color, tempo_color_date = self._resolve_tempo_color(nodes)
+
+        # Sur 60 relevés, chaque registre revient une fois par jour : ne garder
+        # que la journée la plus récente, sinon les valeurs d'index exposées
+        # seraient celles du jour le plus ancien de la fenêtre.
+        days = {day for node in nodes if (day := self._reading_date(node))}
+        latest_day = max(days) if days else None
+        if latest_day:
+            nodes = [node for node in nodes if self._reading_date(node) == latest_day]
+
         index_data = {}
         period_start = None
         period_end = None
         tariff_type = None
-        # Date locale HA : entre 22h/23h UTC et minuit UTC, la date UTC est encore
-        # « aujourd'hui » alors que la France est déjà demain.
-        tomorrow_str = (dt_util.now().date() + timedelta(days=1)).isoformat()
 
-        for edge in edges:
-            node = edge.get("node") or {}
+        for node in nodes:
             temp_class = node.get("calendarTempClass")
 
             temporal_class = node.get("temporalClass") or {}
@@ -1274,26 +1348,8 @@ class OctopusFrenchApiClient:
                     period_end = node.get("periodEndAt")
                 _LOGGER.debug("OctoTempo: code '%s' → clé '%s'", effective_code, key)
 
-                color = self._REGISTER_CODE_TO_COLOR.get(effective_code)
-                if color:
-                    node_date = (node.get("periodStartAt") or "")[:10]
-                    color_key = (
-                        "tempo_color_tomorrow"
-                        if node_date == tomorrow_str
-                        else "tempo_color"
-                    )
-                    index_data.setdefault(color_key, color)
-
             elif effective_code in self._CALENDAR_COLOR_TO_COLOR:
                 tariff_type = "TEMPO"
-                color = self._CALENDAR_COLOR_TO_COLOR[effective_code]
-                node_date = (node.get("periodStartAt") or "")[:10]
-                color_key = (
-                    "tempo_color_tomorrow"
-                    if node_date == tomorrow_str
-                    else "tempo_color"
-                )
-                index_data.setdefault(color_key, color)
 
                 if not period_start:
                     period_start = node.get("periodStartAt")
@@ -1307,15 +1363,27 @@ class OctopusFrenchApiClient:
                     temp_class,
                 )
 
-        if not index_data:
+        # Un contrat Tempo « legacy » n'expose qu'un `calendarTempClass` par jour,
+        # sans valeur d'index : la couleur reste alors la seule donnée utile.
+        if not index_data and not tempo_color:
             _LOGGER.warning("No index data found for PRM %s", prm_id)
             return None
 
-        result_data = {
+        result_data: dict[str, Any] = {
             "tariff_type": tariff_type,
             "period_start": period_start,
             "period_end": period_end,
         }
+
+        if tempo_color:
+            result_data["tempo_color"] = tempo_color
+            result_data["tempo_color_date"] = tempo_color_date
+            _LOGGER.debug(
+                "OctoTempo: couleur '%s' retenue pour le %s (PRM %s)",
+                tempo_color,
+                tempo_color_date,
+                prm_id,
+            )
 
         result_data.update(index_data)
 

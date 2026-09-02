@@ -1,3 +1,23 @@
+## [Non publié]
+
+### 🐛 Correction — Couleur OctoTempo figée sur ROUGE (issue [#84](https://github.com/domodom30/ha-octopus-french/issues/84))
+
+Un contrat OctoTempo expose six registres (`HPE`/`HCE`, `HPHI`/`HCHI`, `HPP`/`HCP`) et l'API renvoie une entrée par registre **pour une même journée**. L'intégration retenait la couleur de la première entrée reçue, sans vérifier si ce registre portait la moindre consommation : l'ordre de l'API décidait donc de la couleur, et restait le même à chaque rafraîchissement. Sur le compte du rapporteur, `HCP` ouvrait la liste — d'où un `ROUGE` permanent en plein mois d'août, alors que seuls les registres Été étaient consommés.
+
+La couleur est désormais celle des registres qui portent réellement la consommation, sur la journée relevée la plus récente. Une journée sans consommation ne fige plus rien : la recherche remonte au jour précédent. Le capteur expose la date du relevé retenu, pour rendre visible le décalage de deux jours des relevés Enedis.
+
+Deux défauts en découlaient et se corrigent d'eux-mêmes : le capteur **Tarif Tempo en cours** appliquait le prix Rouge au lieu du prix de la couleur réelle, et le capteur binaire **Heures Creuses** utilisait les plages du jour rouge au lieu de celles de la saison — il ignorait donc la plage méridienne de l'été (11h-17h). Merci à [@Lordero](https://github.com/Lordero) pour un rapport particulièrement détaillé.
+
+### 🐛 Correction — Valeurs d'index prises sur le mauvais jour
+
+La requête d'index ne demandait que 8 relevés, dimensionnement hérité des contrats Heures Pleines / Heures Creuses à deux registres. Sur un contrat OctoTempo à six registres, cela couvrait à peine une journée et le second jour arrivait toujours tronqué. La fenêtre passe à 60 relevés — dix jours en OctoTempo, le maximum accepté par l'API étant 100.
+
+Les valeurs d'index exposées sont maintenant restreintes à la journée la plus récente. Elles étaient jusqu'ici écrasées par chaque relevé plus ancien de la fenêtre, si bien que la période affichée et les index affichés ne décrivaient pas le même jour.
+
+### 🛠️ Outils — Collecte OctoTempo anonymisée
+
+Nouveau script `tools/octoflex.py` : en une commande, il rassemble le calendrier fournisseur, `offPeakValues`, les tarifs souscrits avec leurs classes temporelles, 90 relevés d'index et 60 jours de relevés quotidiens. Il affiche la couleur déduite jour par jour et écrit un JSON dont le PRM, le numéro de compte, l'adresse et l'e-mail sont remplacés par des jetons stables : le fichier peut être joint tel quel à une issue.
+
 ## [4.1.6] - 2026-08-26
 
 ### 🐛 Correction — Consommation et coût gaz bloqués à 0 (issue [#79](https://github.com/domodom30/ha-octopus-french/issues/79))

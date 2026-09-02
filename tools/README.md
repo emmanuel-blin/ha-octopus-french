@@ -50,6 +50,7 @@ export OCTOPUS_ACCOUNT=A-XXXX0000
 | `account.py` | Données du compte (compteurs, accords, `product.code`, tarifs) |
 | `readings.py` | Relevés de consommation avec labels `metaData.statistics` |
 | `index.py` | Index électrique Linky (`calendarTempClass`, valeurs d'index) |
+| `octoflex.py` | Collecte complète et anonymisée d'un contrat OctoTempo / OctoFlex |
 | `schema.py` | Introspection du schéma GraphQL |
 | `query.py` | Exécution d'une requête GraphQL libre |
 
@@ -126,7 +127,46 @@ python tools/index.py --account A-XXXX0000 --prm 12345678901234 --raw
 > `temporalClass.code` est affiché en priorité (champ structuré avec label et registerId).
 > `calendarTempClass` reste affiché comme référence legacy si présent.
 
-### 5. Introspection du schéma GraphQL
+### 5. Collecte OctoTempo / OctoFlex (anonymisée)
+
+```bash
+# Tout en une commande : calendrier fournisseur, offPeakValues, tarifs,
+# 90 relevés d'index et 60 jours de relevés quotidiens
+python tools/octoflex.py
+
+# Sur un PRM précis, avec des fenêtres plus larges
+python tools/octoflex.py --prm 12345678901234 --first 100 --days 90
+
+# Autre fichier de sortie
+python tools/octoflex.py --output diagnostic-lordero.json
+```
+
+Le script affiche un résumé lisible — couleur déduite jour par jour, bornes de
+saison, décalage du dernier relevé — et écrit un fichier JSON **anonymisé** :
+PRM, numéro de compte, adresse, e-mail et identifiants internes sont remplacés
+par des jetons stables (`<PRM_1>`, `<COMPTE_1>`…), ce qui préserve les
+recoupements sans exposer de données personnelles. Le fichier produit peut être
+joint tel quel à une issue GitHub.
+
+`--no-anonymize` conserve les données brutes, pour un usage strictement local.
+
+**Exemple de sortie :**
+```
+📅  Calendrier fournisseur : OCTOFLEX_4_V4 — OctoTempo
+    HCE    [ETE   ] Avril à octobre, 21h à 7h et de 11h à 17h
+    HCHI   [HIVER ] Novembre à mars, de 21h à 7h
+    HCP    [ROUGE ] Heures creuses en jour rouge, de 21h à 7h
+
+🎨  Couleur par journée relevée (10 jours) :
+    2026-08-31  →  ETE     (ETE=14.500 HIVER=0.000 ROUGE=0.000)
+
+⏱️   Dernier relevé d'index : 2026-08-31 (2 jour(s) de décalage)
+```
+
+> ⚠️ `electricityReading` plafonne `first` à **100** : au-delà, l'API répond
+> « Invalid pagination parameters ». Le script ramène automatiquement la valeur.
+
+### 6. Introspection du schéma GraphQL
 
 ```bash
 # Liste tous les types disponibles
@@ -146,7 +186,7 @@ python tools/schema.py --search calendar
 python tools/schema.py --raw > schema_dump.json
 ```
 
-### 6. Requête GraphQL libre
+### 7. Requête GraphQL libre
 
 ```bash
 # Depuis stdin
@@ -216,6 +256,7 @@ tools/
 ├── account.py      ← Données du compte
 ├── readings.py     ← Relevés de consommation
 ├── index.py        ← Index Linky
+├── octoflex.py     ← Collecte OctoTempo complète et anonymisée
 ├── schema.py       ← Introspection GraphQL
 └── query.py        ← Requête libre
 ```

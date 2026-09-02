@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime
 from unittest.mock import MagicMock, patch
 from zoneinfo import ZoneInfo
 
@@ -582,27 +582,124 @@ class TestElectricityIndexTempo:
         assert result.get("tempo_color") == "ETE"
         assert "tempo_color_tomorrow" not in result
 
+
+# Ordre dans lequel l'API renvoie les six registres OctoTempo pour une même
+# journée, relevé dans les logs de l'issue #84 : `HCP` arrive en tête alors que
+# la journée était en fait ÉTÉ.
+_ISSUE_84_REGISTER_ORDER = ("HCP", "HPE", "HPHI", "HPP", "HCE", "HCHI")
+
+
+def _octotempo_edges(day: str, consumption: dict[str, float]) -> list[dict]:
+    """Construit les six edges d'une journée OctoTempo, dans l'ordre de l'API."""
+    return [
+        {
+            "node": {
+                "temporalClass": {
+                    "code": code,
+                    "label": code,
+                    "registerId": register_id,
+                },
+                "calendarTempClass": None,
+                "consumption": consumption.get(code, 0),
+                "indexStartValue": 1000,
+                "indexEndValue": 1000 + int(consumption.get(code, 0)),
+                "statusProcessed": "REAL",
+                "consumptionReliability": "REAL",
+                "indexReliability": "REAL",
+                "periodStartAt": f"{day}T00:00:00+02:00",
+                "periodEndAt": f"{day}T23:59:59+02:00",
+            }
+        }
+        for register_id, code in enumerate(_ISSUE_84_REGISTER_ORDER)
+    ]
+
+
+def _octotempo_response(days: dict[str, dict[str, float]]) -> dict:
+    """Réponse `electricityReading` couvrant plusieurs journées OctoTempo."""
+    edges: list[dict] = []
+    for day, consumption in sorted(days.items(), reverse=True):
+        edges.extend(_octotempo_edges(day, consumption))
+    return {"data": {"electricityReading": {"edges": edges}}}
+
+
+class TestOctoTempoColorFromRegisters:
+    """Couleur OctoTempo dérivée des registres consommés (issue #84)."""
+
+    async def _color(self, response: dict) -> dict:
+        client = OctopusFrenchApiClient.__new__(OctopusFrenchApiClient)
+        with patch.object(client, "execute_with_auth", return_value=response):
+            result = await client.get_electricity_index("ACC123", "PRM456")
+        assert result is not None
+        return result
+
+    @pytest.mark.parametrize(
+        ("consumption", "expected_color"),
+        [
+            pytest.param({"HPE": 3.8, "HCE": 10.7}, "ETE", id="ete"),
+            pytest.param({"HPHI": 5.1, "HCHI": 12.4}, "HIVER", id="hiver"),
+            pytest.param({"HPP": 4.2, "HCP": 9.9}, "ROUGE", id="rouge"),
+        ],
+    )
     @pytest.mark.asyncio
-    async def test_tomorrow_color_detected(self) -> None:
-        """Une edge datée de demain → tempo_color_tomorrow (sans tempo_color)."""
-        from custom_components.octopus_french.octopus_french import (
-            OctopusFrenchApiClient,
+    async def test_color_follows_consumed_registers(
+        self, consumption: dict[str, float], expected_color: str
+    ) -> None:
+        """La couleur est celle des registres consommés, pas de la première edge.
+
+        Régression de l'issue #84 : `HCP` ouvre la liste dans les trois cas, donc
+        l'ancienne implémentation renvoyait `ROUGE` quelle que soit la journée.
+        """
+        result = await self._color(_octotempo_response({"2026-08-31": consumption}))
+
+        assert result["tariff_type"] == TARIFF_TYPE_TEMPO
+        assert result["tempo_color"] == expected_color
+        assert result["tempo_color_date"] == "2026-08-31"
+
+    @pytest.mark.asyncio
+    async def test_latest_consumed_day_wins(self) -> None:
+        """Entre deux journées relevées, la plus récente donne la couleur."""
+        result = await self._color(
+            _octotempo_response(
+                {
+                    "2026-08-30": {"HPP": 4.2, "HCP": 9.9},
+                    "2026-08-31": {"HPE": 3.8, "HCE": 10.7},
+                }
+            )
         )
 
-        client = OctopusFrenchApiClient.__new__(OctopusFrenchApiClient)
-        # Idem : la date « demain » doit être calculée dans le fuseau HA.
-        tomorrow_str = (dt_util.now().date() + timedelta(days=1)).isoformat()
+        assert result["tempo_color"] == "ETE"
+        assert result["tempo_color_date"] == "2026-08-31"
 
-        with patch.object(
-            client,
-            "execute_with_auth",
-            return_value=self._make_index_response_with_date("ROUGE", tomorrow_str),
-        ):
-            result = await client.get_electricity_index("ACC123", "PRM456")
+    @pytest.mark.asyncio
+    async def test_day_without_consumption_falls_back(self) -> None:
+        """Une journée à 0 kWh partout ne fige pas la couleur : on remonte d'un jour."""
+        result = await self._color(
+            _octotempo_response(
+                {
+                    "2026-08-30": {"HPP": 4.2, "HCP": 9.9},
+                    "2026-08-31": {},
+                }
+            )
+        )
 
-        assert result is not None
-        assert result.get("tempo_color_tomorrow") == "ROUGE"
-        assert "tempo_color" not in result
+        assert result["tempo_color"] == "ROUGE"
+        assert result["tempo_color_date"] == "2026-08-30"
+
+    @pytest.mark.asyncio
+    async def test_index_values_come_from_latest_day(self) -> None:
+        """Les valeurs d'index exposées sont celles du jour le plus récent."""
+        result = await self._color(
+            _octotempo_response(
+                {
+                    "2026-08-30": {"HPE": 1.0, "HCE": 2.0},
+                    "2026-08-31": {"HPE": 3.0, "HCE": 4.0},
+                }
+            )
+        )
+
+        assert result["period_start"].startswith("2026-08-31")
+        assert result["tempo_ete_hp"]["consumption"] == 3.0
+        assert result["tempo_ete_hc"]["consumption"] == 4.0
 
 
 class TestTempoCurrentRateSensor:
